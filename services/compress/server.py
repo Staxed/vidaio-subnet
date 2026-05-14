@@ -5,6 +5,7 @@ This module provides a FastAPI server for video compression services.
 It handles video upload, compression, and storage operations.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -19,6 +20,7 @@ from loguru import logger
 from video_preprocessor import pre_processing
 from scene_detector import scene_detection
 from encoder import ai_encoding, load_encoding_resources
+from iterative_encoder import iterative_encode
 from vmaf_calculator import scene_vmaf_calculation
 from validator_merger import validation_and_merging
 from vidaio_subnet_core.utilities import storage_client, download_video
@@ -184,21 +186,40 @@ def map_codec_name(target_codec: str, prefer_gpu: bool = True) -> str:
 async def compress_video(video: CompressPayload):
     """
     Compress a video from a URL payload.
-    
+
     Args:
         video: Compression request payload
-        
+
     Returns:
         dict: Compression results with uploaded video URL
     """
+    request_start = time.time()
     print(f"video url: {video.payload_url}")
     print(f"vmaf threshold: {video.vmaf_threshold}")
     print(f"target codec: {video.target_codec}")
     print(f"codec mode: {video.codec_mode}")
     print(f"target bitrate: {video.target_bitrate} Mbps")
 
-    # Download video from URL
-    input_path = await download_video(video.payload_url)
+    # Download with retry — transient S3 errors sometimes resolve on retry
+    input_path = None
+    last_dl_err = None
+    for attempt in range(3):
+        try:
+            input_path = await download_video(video.payload_url)
+            break
+        except Exception as dl_err:
+            last_dl_err = dl_err
+            elapsed = time.time() - request_start
+            print(f"Download attempt {attempt+1}/3 failed after {elapsed:.1f}s: {dl_err}")
+            if "404" in str(dl_err) or "403" in str(dl_err) or elapsed > 30:
+                break
+            await asyncio.sleep(2)
+    if input_path is None:
+        print(f"Download failed permanently: {last_dl_err}")
+        return {"uploaded_video_url": None, "status": "download_failed",
+                "detail": f"Could not download source video: {last_dl_err}"}
+    download_time = time.time() - request_start
+    print(f"Download took {download_time:.1f}s, {135 - download_time:.0f}s remaining for encode+upload")
     input_file = Path(input_path)
     vmaf_threshold = video.vmaf_threshold
 
@@ -215,8 +236,10 @@ async def compress_video(video: CompressPayload):
             detail=f"Invalid VMAF threshold. Expected {VMAF_THRESHOLD_LOW}, {VMAF_THRESHOLD_MEDIUM}, or {VMAF_THRESHOLD_HIGH}, got {vmaf_threshold}"
         )
 
-    # Map codec name from protocol format to ffmpeg encoder name
-    ffmpeg_codec = map_codec_name(video.target_codec, prefer_gpu=True)
+    # AV1: GPU (NVENC)
+    # HEVC: CPU (libx265) — better compression efficiency per VMAF point than hevc_nvenc
+    use_gpu = video.target_codec.lower() != 'hevc'
+    ffmpeg_codec = map_codec_name(video.target_codec, prefer_gpu=use_gpu)
 
     # Validate input file
     if not input_file.is_file():
@@ -225,6 +248,11 @@ async def compress_video(video: CompressPayload):
     # Create output directory
     output_dir = Path(video.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Calculate real time remaining (accounts for download time and queue wait)
+    elapsed_so_far = time.time() - request_start
+    remaining_for_pipeline = max(30, 135 - elapsed_so_far - 10)  # 10s for upload
+    print(f"Time budget for pipeline: {remaining_for_pipeline:.0f}s (elapsed so far: {elapsed_so_far:.1f}s)")
 
     # Perform video compression
     try:
@@ -236,8 +264,9 @@ async def compress_video(video: CompressPayload):
             target_bitrate=video.target_bitrate,
             max_duration=video.max_duration,
             output_dir=str(output_dir),
-            skip_scene_detection=True,  # Skip for miner chunks (already pre-split)
-            skip_preprocessing=True  # Skip for miner chunks (already compressed)
+            skip_scene_detection=True,
+            skip_preprocessing=True,
+            time_budget=remaining_for_pipeline,
         )
         print(f"compressed_video_path: {compressed_video_path}")
 
@@ -340,7 +369,8 @@ def video_compressor(
     max_duration: int = 3600,
     output_dir: str = './output',
     skip_scene_detection: bool = True,
-    skip_preprocessing: bool = True
+    skip_preprocessing: bool = True,
+    time_budget: float = 120.0,
 ) -> Optional[str]:
     """
     Main video compression pipeline orchestrator.
@@ -431,8 +461,11 @@ def video_compressor(
         part2_time = time.time() - part2_start_time
         _display_scene_detection_results(scenes_metadata, part2_time)
     
-    # PART 3: AI Encoding
-    part3_result = _execute_ai_encoding(scenes_metadata, config, target_quality)
+    # PART 3: AI Encoding — pass remaining time budget
+    elapsed_pipeline = time.time() - pipeline_start_time
+    encode_budget = max(30, time_budget - elapsed_pipeline)
+    part3_result = _execute_ai_encoding(scenes_metadata, config, target_quality,
+                                        encode_budget=encode_budget)
     if not part3_result:
         print("❌ Part 3 failed completely. Pipeline terminated.")
         return False
@@ -552,30 +585,30 @@ def _get_default_config() -> dict:
             'codec_mode': 'CRF',  # Will be overridden by request
             'target_bitrate': 10.0,  # Will be overridden by request
             'size_increase_protection': True,
-            'conservative_cq_adjustment': 2,
+            'conservative_cq_adjustment': 0,
             'max_output_size_ratio': 1.15,
             'max_encoding_retries': 2,
             'basic_cq_lookup_by_quality': {
                 'High': {
-                    'animation': 22,
-                    'low-action': 20,
-                    'medium-action': 18,
-                    'high-action': 16,
-                    'default': 19
+                    'animation': 44,
+                    'low-action': 40,
+                    'medium-action': 38,
+                    'high-action': 34,
+                    'default': 40
                 },
                 'Medium': {
-                    'animation': 25,
-                    'low-action': 23,
-                    'medium-action': 21,
-                    'high-action': 19,
-                    'default': 22
+                    'animation': 46,
+                    'low-action': 42,
+                    'medium-action': 40,
+                    'high-action': 36,
+                    'default': 42
                 },
                 'Low': {
-                    'animation': 28,
-                    'low-action': 26,
-                    'medium-action': 24,
-                    'high-action': 22,
-                    'default': 25
+                    'animation': 52,
+                    'low-action': 48,
+                    'medium-action': 46,
+                    'high-action': 42,
+                    'default': 48
                 }
             },
         },
@@ -659,57 +692,62 @@ def _display_scene_detection_results(scenes_metadata: list, part2_time: float):
         print(f"   📊 Total scene files: {total_scene_size:.1f} MB")
 
 
-def _execute_ai_encoding(scenes_metadata: list, config: dict, target_quality: str) -> Optional[dict]:
+def _execute_ai_encoding(scenes_metadata: list, config: dict, target_quality: str,
+                         encode_budget: float = 120.0) -> Optional[dict]:
     """Execute Part 3: AI Encoding."""
-    print(f"\n🧠 === Part 3: AI Encoding ===")
+    print(f"\n🧠 === Part 3: AI Encoding (budget: {encode_budget:.0f}s) ===")
     part3_start_time = time.time()
-    
-    print(f"   🔧 Loading AI models and resources...")
-    print(f"   📋 Using quality-based CQ lookup tables for {target_quality} quality")
-    print(f"   🎯 Target Quality Level: {target_quality}")
-    
-    # Display CQ ranges for selected quality level
-    quality_info = {
-        'High': {'vmaf': 93, 'cq_range': '16-22'},
-        'Medium': {'vmaf': 89, 'cq_range': '19-25'},
-        'Low': {'vmaf': 85, 'cq_range': '22-28'}
-    }
-    
-    if target_quality in quality_info:
-        info = quality_info[target_quality]
-        print(f"   🎚️ CQ Range for {target_quality}: {info['cq_range']} (Target VMAF: {info['vmaf']})")
-    
-    print(f"   🔧 Loading AI models and resources...")
-    
+
+    TOTAL_ENCODE_BUDGET = encode_budget
+
+    vmaf_threshold = {'High': 93.0, 'Medium': 89.0, 'Low': 85.0}.get(target_quality, 89.0)
+    codec = config.get('video_processing', {}).get('target_codec', 'av1_nvenc')
+    codec_mode = config.get('video_processing', {}).get('codec_mode', 'CRF')
+    target_bitrate = config.get('video_processing', {}).get('target_bitrate', 10.0)
+
+    print(f"   🎯 Target: VMAF {vmaf_threshold} | Codec: {codec} | Mode: {codec_mode}")
+    print(f"   🧠 Method: VMAF-targeted iterative binary search")
+
     try:
         resources = load_encoding_resources(config, logging_enabled=True)
         print(f"   ✅ AI resources loaded successfully")
-        print(f"   🧠 Mode: Scene classification + CQ lookup table")
     except Exception as e:
-        print(f"   ❌ Failed to load GGG AI resources: {e}")
+        print(f"   ❌ Failed to load AI resources: {e}")
         return None
-    
+
     # Process each scene individually
     encoded_scenes_data = []
     successful_encodings = 0
     failed_encodings = 0
     total_input_size = 0
     total_output_size = 0
-    
-    print(f"\n   📊 Processing {len(scenes_metadata)} scenes with AI approach...")
-    
+    total_scenes = len(scenes_metadata)
+
+    print(f"\n   📊 Processing {total_scenes} scenes with iterative encoder...")
+
     for i, scene_metadata in enumerate(scenes_metadata):
+        # Calculate per-scene time budget from remaining time
+        elapsed = time.time() - part3_start_time
+        remaining_budget = TOTAL_ENCODE_BUDGET - elapsed
+        remaining_scenes = total_scenes - i
+        scene_time_budget = remaining_budget / remaining_scenes
+
         scene_result = _process_single_scene(
-            scene_metadata, i, len(scenes_metadata), config, resources, target_quality
+            scene_metadata, i, total_scenes, config, resources, target_quality,
+            scene_time_budget=scene_time_budget,
+            vmaf_threshold=vmaf_threshold,
+            codec=codec,
+            codec_mode=codec_mode,
+            target_bitrate=target_bitrate,
         )
-        
+
         if scene_result['success']:
             successful_encodings += 1
             total_input_size += scene_result['input_size_mb']
             total_output_size += scene_result['output_size_mb']
         else:
             failed_encodings += 1
-        
+
         encoded_scenes_data.append(scene_result['scene_data'])
     
     part3_time = time.time() - part3_start_time
@@ -734,78 +772,143 @@ def _execute_ai_encoding(scenes_metadata: list, config: dict, target_quality: st
     }
 
 
-def _process_single_scene(scene_metadata: dict, scene_index: int, total_scenes: int, 
-                         config: dict, resources: dict, target_quality: str) -> dict:
-    """Process a single scene for AI encoding."""
+def _process_single_scene(scene_metadata: dict, scene_index: int, total_scenes: int,
+                         config: dict, resources: dict, target_quality: str,
+                         scene_time_budget: float = 120.0,
+                         vmaf_threshold: float = 89.0,
+                         codec: str = 'av1_nvenc',
+                         codec_mode: str = 'CRF',
+                         target_bitrate: float = 10.0) -> dict:
+    """Process a single scene using VMAF-targeted iterative encoding with content analysis."""
     scene_number = scene_metadata['scene_number']
     scene_path = scene_metadata['path']
     scene_duration = scene_metadata['duration']
-    
+
     print(f"\n   🎬 Scene {scene_number}/{total_scenes}: {os.path.basename(scene_path)}")
-    print(f"      ⏱️ Duration: {scene_duration:.1f}s")
-    
-    indicative_vmaf = scene_metadata['original_video_metadata'].get('target_vmaf')
-    print(f"      🎯 Target Quality: {target_quality}" + (f" (VMAF≈{indicative_vmaf})" if indicative_vmaf else ""))
-    print(f"      🧠 Method: scene classification + CQ lookup")
-    
+    print(f"      ⏱️ Duration: {scene_duration:.1f}s | Budget: {scene_time_budget:.0f}s")
+    print(f"      🎯 VMAF target: {vmaf_threshold} | Codec: {codec} | Mode: {codec_mode}")
+
     scene_start_time = time.time()
-    
+
+    # Content analysis: classify scene and extract contrast for content-aware encoding
+    scene_type = None
+    contrast_value = None
+    if resources and resources.get('scene_classifier_model'):
+        try:
+            from utils.processing_utils import classify_scene_from_path
+            temp_dir = config.get('directories', {}).get('temp_dir', './videos/temp_scenes')
+            classification_result = classify_scene_from_path(
+                scene_path=scene_path,
+                temp_dir=temp_dir,
+                scene_classifier_model=resources['scene_classifier_model'],
+                available_metrics=resources.get('available_metrics', []),
+                device=resources.get('device', 'cpu'),
+                metrics_scaler=resources.get('feature_scaler_step'),
+                class_mapping=resources.get('class_mapping'),
+                logging_enabled=False,
+                num_frames=3,
+            )
+            if isinstance(classification_result, tuple) and len(classification_result) >= 2:
+                scene_type = classification_result[0]
+                video_features = classification_result[2] if len(classification_result) >= 3 else {}
+                contrast_value = video_features.get('contrast', video_features.get('metrics_avg_contrast'))
+            analysis_time = time.time() - scene_start_time
+            print(f"      🎭 Scene: '{scene_type}' | Contrast: {contrast_value:.2f if contrast_value else 'N/A'} "
+                  f"({analysis_time:.1f}s)")
+        except Exception as e:
+            print(f"      ⚠️ Scene classification failed ({e}), using defaults")
+
+    # Determine output path
+    output_dir = config.get('directories', {}).get('temp_dir', './videos/temp_scenes')
+    base_name = os.path.splitext(os.path.basename(scene_path))[0]
+    output_path = os.path.join(output_dir, f"{base_name}_encoded.mp4")
+
+    # Reduce time budget by analysis time
+    elapsed_analysis = time.time() - scene_start_time
+    adjusted_budget = scene_time_budget - elapsed_analysis
+
     try:
-        encoded_path, scene_data = ai_encoding(
-            scene_metadata=scene_metadata,
-            config=config,
-            resources=resources,
-            target_vmaf=None,
-            target_quality_level=target_quality,
-            logging_enabled=True
+        result = iterative_encode(
+            input_path=scene_path,
+            output_path=output_path,
+            codec=codec,
+            vmaf_threshold=vmaf_threshold,
+            codec_mode=codec_mode,
+            target_bitrate=target_bitrate,
+            time_budget=adjusted_budget,
+            scene_type=scene_type,
+            contrast_value=contrast_value,
         )
-        
+
         scene_processing_time = time.time() - scene_start_time
-        
-        if encoded_path and scene_data.get('encoding_success', False):
-            size_mb = scene_data.get('encoded_file_size_mb', 0)
-            input_size_mb = scene_data.get('input_size_mb', 0)
-            compression = scene_data.get('compression_ratio', 0)
-            
+
+        if result['success'] and os.path.exists(output_path):
+            input_size_mb = os.path.getsize(scene_path) / (1024 * 1024)
+            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+
             print(f"      ✅ Scene {scene_number} encoded successfully")
-            print(f"         📁 Output: {os.path.basename(encoded_path)}")
-            print(f"         📊 Size: {input_size_mb:.1f} MB → {size_mb:.1f} MB ({compression:+.1f}% compression)")
-            print(f"         🎭 Scene type: {scene_data.get('scene_type', 'unknown')}")
-            print(f"         🎯 Quality: {scene_data.get('target_quality_level', target_quality)}")
-            print(f"         🎚️ CQ used: {scene_data.get('base_cq_for_quality', 'N/A')} → {scene_data.get('final_adjusted_cq', 'unknown')} (after adjustment)")
-            print(f"         📋 Method: Quality-based lookup table CQ selection")
+            print(f"         📊 Size: {input_size_mb:.1f} MB → {output_size_mb:.1f} MB "
+                  f"({result['compression_ratio']:.1f}x)")
+            if result.get('vmaf') is not None:
+                print(f"         🎯 VMAF: {result['vmaf']:.2f} (threshold: {vmaf_threshold})")
+            print(f"         🎚️ Rate: {result['rate']} | Iterations: {result['iterations']}"
+                  f"{' (fallback)' if result.get('fallback') else ''}")
             print(f"         ⏱️ Processing: {scene_processing_time:.1f}s")
-            
-            # Update scene metadata
-            scene_metadata['encoded_path'] = encoded_path
+
+            scene_data = {
+                'scene_number': scene_number,
+                'encoding_success': True,
+                'encoded_file_size_mb': output_size_mb,
+                'input_size_mb': input_size_mb,
+                'compression_ratio': result['compression_ratio'],
+                'vmaf_score': result.get('vmaf'),
+                'final_rate': result['rate'],
+                'iterations': result['iterations'],
+                'fallback': result.get('fallback', False),
+                'processing_time_seconds': scene_processing_time,
+                'encoded_path': output_path,
+                'original_video_metadata': scene_metadata['original_video_metadata'],
+                'target_quality_level': target_quality,
+            }
+
+            scene_metadata['encoded_path'] = output_path
             scene_metadata['encoding_data'] = scene_data
-            
+
             return {
                 'success': True,
                 'scene_data': scene_data,
                 'input_size_mb': input_size_mb,
-                'output_size_mb': size_mb
+                'output_size_mb': output_size_mb,
             }
         else:
-            error_reason = scene_data.get('error_reason', 'Unknown error')
-            print(f"      ❌ Scene {scene_number} encoding failed: {error_reason}")
+            # Iterative encoder produced no output — report failure
+            # Do NOT fall back to ai_encoding (takes 60-90s, causes overtime)
+            scene_processing_time = time.time() - scene_start_time
+            print(f"      ❌ Scene {scene_number} iterative encoder failed, no output")
             print(f"         ⏱️ Processing: {scene_processing_time:.1f}s")
-            
+
+            error_scene_data = {
+                'scene_number': scene_number,
+                'encoding_success': False,
+                'error_reason': 'Iterative encoder failed to produce output',
+                'processing_time_seconds': scene_processing_time,
+                'encoded_path': None,
+                'original_video_metadata': scene_metadata['original_video_metadata'],
+            }
             scene_metadata['encoded_path'] = None
-            scene_metadata['encoding_data'] = scene_data
-            
+            scene_metadata['encoding_data'] = error_scene_data
             return {
                 'success': False,
-                'scene_data': scene_data,
+                'scene_data': error_scene_data,
                 'input_size_mb': 0,
-                'output_size_mb': 0
+                'output_size_mb': 0,
             }
-            
+
     except Exception as e:
         scene_processing_time = time.time() - scene_start_time
-        print(f"      ❌ Scene {scene_number} processing failed with exception: {e}")
+        print(f"      ❌ Scene {scene_number} failed: {e}")
         print(f"         ⏱️ Processing: {scene_processing_time:.1f}s")
-        
+
         error_scene_data = {
             'scene_number': scene_number,
             'encoding_success': False,
@@ -814,15 +917,15 @@ def _process_single_scene(scene_metadata: dict, scene_index: int, total_scenes: 
             'encoded_path': None,
             'original_video_metadata': scene_metadata['original_video_metadata']
         }
-        
+
         scene_metadata['encoded_path'] = None
         scene_metadata['encoding_data'] = error_scene_data
-        
+
         return {
             'success': False,
             'scene_data': error_scene_data,
             'input_size_mb': 0,
-            'output_size_mb': 0
+            'output_size_mb': 0,
         }
 
 
@@ -970,10 +1073,19 @@ def _display_pipeline_summary(input_file: str, final_video_path: str, part1_resu
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("Starting video compressor server")
+    # 3 workers: handles concurrent validator requests without queueing.
+    # AV1 uses GPU (NVENC supports 8 sessions), HEVC uses CPU (32 cores available).
+    WORKERS = 3
+
+    logger.info(f"Starting video compressor server ({WORKERS} workers)")
     logger.info(f"Video compressor server running on http://{CONFIG.video_compressor.host}:{CONFIG.video_compressor.port}")
 
-    uvicorn.run(app, host=CONFIG.video_compressor.host, port=CONFIG.video_compressor.port)
+    uvicorn.run(
+        "server:app",
+        host=CONFIG.video_compressor.host,
+        port=CONFIG.video_compressor.port,
+        workers=WORKERS,
+    )
 
     # result = test_video_compression('test1.mp4')
     # print(result)
