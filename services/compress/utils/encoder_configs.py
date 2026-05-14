@@ -8,7 +8,12 @@ ENCODER_SETTINGS = {
         # SVT-AV1 specific settings
     },
     "av1_nvenc": {
-        "codec": "av1_nvenc", "preset": "p6", "cq": 30, "keyint": 50, 'pix_fmt': 'yuv420p'
+        "codec": "av1_nvenc", "preset": "p7", "tune": "hq", "cq": 30,
+        "multipass": "fullres", "rc-lookahead": 32,
+        "bf": 4, "b_ref_mode": "middle",
+        "pix_fmt": "yuv420p",
+        "spatial-aq": 1, "temporal-aq": 1, "aq-strength": 8,
+        "keyint": 250,
     },
     "libvpx_vp9": {  # Changed from "vp9"
         "codec": "libvpx-vp9", "deadline": "good", "cpu-used": 2, "crf": 32, "keyint": 50,
@@ -23,9 +28,10 @@ ENCODER_SETTINGS = {
         "codec": "libvvenc", "preset": "medium", "crf": 28, "keyint": 50,
         # VVC/H.266 encoder
     },
-    "libx265": {  # Changed from "hevc"
-        "codec": "libx265", "preset": "medium", "crf": 28, "keyint": 50,
-        "aq-mode": 2, "aq-strength": 1.0
+    "libx265": {
+        "codec": "libx265", "preset": "fast", "crf": 28,
+        "pix_fmt": "yuv420p",
+        "keyint": 300,
     },
     "hevc_nvenc": {
         "codec": "hevc_nvenc", "preset": "p4", "rc": "constqp", "cq": 22, "keyint": 50,
@@ -50,13 +56,13 @@ ENCODER_SETTINGS = {
 # Scene-Specific Parameter Overrides (including AQ and keyint)
 # These are examples and need tuning based on content and codec specifics.
 SCENE_SPECIFIC_PARAMS = {
-    'av1_nvenc': {  # Changed from 'AV1_NVENC'
-        'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
-        'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
-        'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
-        'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
-        'other': {'keyint': 100},
-        'unclear': {'keyint': 100},
+    'av1_nvenc': {
+        'Screen Content / Text': {'spatial-aq': 0, 'temporal-aq': 1, 'aq-strength': 4, 'keyint': 500},
+        'Faces / People': {'spatial-aq': 1, 'temporal-aq': 1, 'aq-strength': 10, 'keyint': 250},
+        'Animation / Cartoon / Rendered Graphics': {'spatial-aq': 1, 'temporal-aq': 0, 'aq-strength': 5, 'keyint': 300},
+        'Gaming Content': {'spatial-aq': 1, 'temporal-aq': 0, 'aq-strength': 12, 'keyint': 100},
+        'other': {'spatial-aq': 1, 'temporal-aq': 1, 'aq-strength': 8, 'keyint': 250},
+        'unclear': {'spatial-aq': 1, 'temporal-aq': 1, 'aq-strength': 8, 'keyint': 250},
     },
     'hevc_nvenc': {  # Changed from 'HEVC_NVENC'
         'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
@@ -83,12 +89,12 @@ SCENE_SPECIFIC_PARAMS = {
         'unclear': {'preset': 'medium', 'tune': 'film', 'aq-mode': 1, 'aq-strength': 1.0, 'keyint': 100},
     },
     'libx265': {
-        'Screen Content / Text': {'preset': 'medium', 'tune': 'grain', 'aq-mode': 2, 'aq-strength': 1.1, 'keyint': 250},
-        'Animation / Cartoon / Rendered Graphics': {'preset': 'medium', 'tune': 'animation', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 150},
-        'Faces / People': {'preset': 'medium', 'aq-mode': 2, 'aq-strength': 0.9, 'keyint': 100},
-        'Gaming Content': {'preset': 'fast', 'tune': 'fastdecode', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 75},
-        'other': {'preset': 'medium', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 100},
-        'unclear': {'preset': 'medium', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 100},
+        'Screen Content / Text': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 1.1, 'keyint': 250},
+        'Animation / Cartoon / Rendered Graphics': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 150},
+        'Faces / People': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 0.9, 'keyint': 100},
+        'Gaming Content': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 75},
+        'other': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 100},
+        'unclear': {'preset': 'fast', 'aq-mode': 2, 'aq-strength': 1.0, 'keyint': 100},
     },
     'libvpx_vp9': {
         'Screen Content / Text': {'deadline': 'best', 'cpu-used': 1, 'aq-mode': 2, 'keyint': 250},
@@ -147,26 +153,31 @@ QUALITY_MAPPING_ANCHORS = {
         ]
     },
     #   Changed "HEVC_NVENC" to "hevc_nvenc" to match ENCODER_SETTINGS
-    "hevc_nvenc": { # Mapping av1_nvenc CQ to hevc_nvenc CQ
+    "hevc_nvenc": { # Tuned: CQ28 → VMAF 90.8 → score 0.315 at T85
         "model_ref_cq_range": [10, 63],
         "target_param_type": "cq",
-        "target_param_range": [10, 51], # Typical CQ range for NVENC HEVC
+        "target_param_range": [10, 40],
         "anchor_points": [ # [model_av1_nvenc_cq, hevc_nvenc_cq]
-            [20, 18], #  HEVC NVENC slightly different scale
-            [30, 23], #  More conservative mapping
-            [40, 28], #  Quality preservation
-            [50, 33]  #  Upper range adjustment
+            [20, 16],
+            [28, 20],
+            [32, 23],
+            [34, 25],
+            [39, 27],
+            [41, 28],
+            [50, 32]
         ]
     },
-    "libx265": { # Mapping av1_nvenc CQ to libx265 CRF
+    "libx265": {
         "model_ref_cq_range": [10, 63],
         "target_param_type": "crf",
-        "target_param_range": [0, 51], # Typical CRF range for libx265
+        "target_param_range": [0, 51],
         "anchor_points": [ # [model_av1_nvenc_cq, libx265_crf]
-            [20, 18], #  x265 is more efficient than H.264
-            [30, 23], #  Similar to H.264 but slightly better
-            [40, 28], #  Conservative quality mapping
-            [50, 33]  #  Upper range adjustment
+            [15, 14],
+            [22, 20],
+            [30, 23],
+            [36, 25],
+            [44, 27],
+            [50, 30]
         ]
     },
     #   Missing codec mappings
