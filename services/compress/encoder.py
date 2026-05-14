@@ -61,29 +61,26 @@ def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_qualit
         quality_tier = 'low'
     
     default_cq_map = {
-        # High quality tier (lower CQ = higher quality)
         'high': {
-            'animation': 25,      # Cartoons compress well naturally
-            'low-action': 23,     # Text/faces need moderate CQ for clarity
-            'medium-action': 21,  # Balanced CQ for general content
-            'high-action': 19,    # Gaming/sports need lower CQ for quality
-            'default': 22         # Safe middle-ground when unsure
+            'animation': 42,
+            'low-action': 38,
+            'medium-action': 36,
+            'high-action': 32,
+            'default': 38
         },
-        # Medium quality tier (balanced CQ)
         'medium': {
-            'animation': 28,      # Cartoons compress well, can use higher CQ
-            'low-action': 26,     # Text/faces need moderate CQ for clarity
-            'medium-action': 24,  # Balanced CQ for general content
-            'high-action': 22,    # Gaming/sports need lower CQ for quality
-            'default': 25         # Safe middle-ground when unsure
+            'animation': 40,
+            'low-action': 36,
+            'medium-action': 34,
+            'high-action': 30,
+            'default': 36
         },
-        # Low quality tier (higher CQ = smaller files)
         'low': {
-            'animation': 31,      # Cartoons compress well, can use higher CQ
-            'low-action': 29,     # Text/faces need moderate CQ for clarity
-            'medium-action': 27,  # Balanced CQ for general content
-            'high-action': 25,    # Gaming/sports need lower CQ for quality
-            'default': 28         # Safe middle-ground when unsure
+            'animation': 46,
+            'low-action': 42,
+            'medium-action': 40,
+            'high-action': 36,
+            'default': 42
         }
     }
     
@@ -705,7 +702,7 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
         print(f"   🎚️ Base CQ from lookup table for '{mapped_scene_type}' at {tier_label} quality: {base_cq}")
     
     # Apply conservative adjustment from config
-    conservative_cq_adjustment = safe_float(config.get('video_processing', {}).get('conservative_cq_adjustment', 2), 2)
+    conservative_cq_adjustment = safe_float(config.get('video_processing', {}).get('conservative_cq_adjustment', 0), 0)
     final_cq = min(base_cq + conservative_cq_adjustment, 51.0)
     if logging_enabled:
         print(f"   🔧 Applied conservative adjustment: +{conservative_cq_adjustment} -> Final CQ: {final_cq}")
