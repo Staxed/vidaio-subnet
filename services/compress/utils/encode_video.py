@@ -249,7 +249,7 @@ def get_contrast_optimized_params(scene_type, contrast_value, codec):
     
     return params
 
-def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, logging_enabled=True):
+def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, logging_enabled=True, vf_filters=None):
     """
     Encodes a video using specified codec settings, optimized for scene type and contrast.
     Audio is copied without re-encoding for efficiency.
@@ -341,27 +341,27 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
                 print(f"CBR mode: bitrate={bitrate_value}, maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k")
 
         elif codec_mode.upper() == 'VBR':
-            # Variable Bitrate Mode - allows bitrate to vary but caps at target
-            # We will still apply CQ/CRF for quality, but add maxrate constraint
-            bitrate_kbps = int(target_bitrate * 1000)
-            bitrate_value = f"{bitrate_kbps}k"
+            # Validator checks average bitrate ≤ target * 1.10 and does NOT
+            # penalize being under-target, so lower average = better compression.
+            maxrate_kbps = int(target_bitrate * 1100)
+            bufsize_kbps = int(target_bitrate * 2000)
 
-            current_settings['maxrate'] = bitrate_value
-            current_settings['bufsize'] = f"{bitrate_kbps * 2}k"
+            current_settings['maxrate'] = f"{maxrate_kbps}k"
+            current_settings['bufsize'] = f"{bufsize_kbps}k"
 
-            # Set rate control mode for NVENC/QSV
             if codec.endswith('_nvenc') or codec.endswith('_qsv'):
+                # NVENC ignores -b:v when CQ is set — CQ dominates quality.
+                # Keep -b:v at target to constrain the average bitrate.
+                current_settings['bitrate'] = f"{int(target_bitrate * 1000)}k"
                 current_settings['rc'] = 'vbr'
-                if logging_enabled:
-                    print(f"Set rate control to VBR")
-            elif 'libvpx' in codec:
-                # VP9/VP8 VBR mode - set target bitrate for VBR with CRF
-                current_settings['bitrate'] = bitrate_value
-                if logging_enabled:
-                    print(f"Set libvpx VBR mode with target bitrate={bitrate_value}")
+            else:
+                # CPU encoders (libx265 etc): capped CRF — no avg target, only
+                # maxrate ceiling. Encoder spends only what CRF quality needs,
+                # saving bits on easy scenes → better compression ratio.
+                current_settings.pop('bitrate', None)
 
             if logging_enabled:
-                print(f"VBR mode: maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k, will apply CQ/CRF for quality")
+                print(f"VBR mode: maxrate={maxrate_kbps}k, bufsize={bufsize_kbps}k")
 
         elif codec_mode.upper() == 'CRF':
             # CRF mode is the default - will apply rate parameter below
@@ -467,8 +467,10 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     # --- Execute FFmpeg ---
     try:
         start_time = time.time()
-        
+
         input_stream = ffmpeg.input(input_path)
+        if vf_filters:
+            output_args['vf'] = vf_filters
         output_stream = ffmpeg.output(input_stream, output_path, **output_args)
         
         result = output_stream.run(
