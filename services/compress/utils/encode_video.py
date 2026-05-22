@@ -341,27 +341,24 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
                 print(f"CBR mode: bitrate={bitrate_value}, maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k")
 
         elif codec_mode.upper() == 'VBR':
-            # Validator checks average bitrate ≤ target * 1.10 and does NOT
-            # penalize being under-target, so lower average = better compression.
+            # Validator checks AVERAGE bitrate <= target * 1.10.
+            # All codecs get maxrate/bufsize to cap bitrate at the encoder level.
+            # The iterative encoder also validates post-encode as a safety net.
+            bitrate_kbps = int(target_bitrate * 1000)
             maxrate_kbps = int(target_bitrate * 1100)
             bufsize_kbps = int(target_bitrate * 2000)
-
-            current_settings['maxrate'] = f"{maxrate_kbps}k"
-            current_settings['bufsize'] = f"{bufsize_kbps}k"
-
             if codec.endswith('_nvenc') or codec.endswith('_qsv'):
-                # NVENC ignores -b:v when CQ is set — CQ dominates quality.
-                # Keep -b:v at target to constrain the average bitrate.
-                current_settings['bitrate'] = f"{int(target_bitrate * 1000)}k"
+                current_settings['bitrate'] = f"{bitrate_kbps}k"
+                current_settings['maxrate'] = f"{maxrate_kbps}k"
+                current_settings['bufsize'] = f"{bufsize_kbps}k"
                 current_settings['rc'] = 'vbr'
             else:
-                # CPU encoders (libx265 etc): capped CRF — no avg target, only
-                # maxrate ceiling. Encoder spends only what CRF quality needs,
-                # saving bits on easy scenes → better compression ratio.
                 current_settings.pop('bitrate', None)
+                current_settings['maxrate'] = f"{maxrate_kbps}k"
+                current_settings['bufsize'] = f"{bufsize_kbps}k"
 
             if logging_enabled:
-                print(f"VBR mode: maxrate={maxrate_kbps}k, bufsize={bufsize_kbps}k")
+                print(f"VBR mode: CRF with maxrate={maxrate_kbps}k bufsize={bufsize_kbps}k")
 
         elif codec_mode.upper() == 'CRF':
             # CRF mode is the default - will apply rate parameter below

@@ -161,9 +161,9 @@ def map_codec_name(target_codec: str, prefer_gpu: bool = True) -> str:
     """
     codec_map = {
         'av1': 'av1_nvenc' if prefer_gpu else 'libsvtav1',
-        'hevc': 'hevc_nvenc' if prefer_gpu else 'libx265',
+        'hevc': 'libx265',
         'h264': 'h264_nvenc' if prefer_gpu else 'libx264',
-        'vp9': 'libvpx_vp9',  # No NVENC encoder for VP9
+        'vp9': 'libvpx_vp9',
     }
 
     # Normalize to lowercase and get mapped codec
@@ -790,30 +790,46 @@ def _process_single_scene(scene_metadata: dict, scene_index: int, total_scenes: 
 
     scene_start_time = time.time()
 
-    # Content analysis: classify scene and extract contrast for content-aware encoding
+    # Content analysis: classify scene and extract contrast for content-aware encoding.
+    # Uses max_frames=10 for video analysis (~2s) instead of the default 150 (~30s).
     scene_type = None
     contrast_value = None
     if resources and resources.get('scene_classifier_model'):
         try:
-            from utils.processing_utils import classify_scene_from_path
+            from utils.analyze_video_fast import analyze_video_fast
+            from utils.processing_utils import extract_frames_from_scene
+            from utils.classify_scene import classify_scene_with_model
+            import subprocess as _sp
+
             temp_dir = config.get('directories', {}).get('temp_dir', './videos/temp_scenes')
-            classification_result = classify_scene_from_path(
-                scene_path=scene_path,
-                temp_dir=temp_dir,
-                scene_classifier_model=resources['scene_classifier_model'],
-                available_metrics=resources.get('available_metrics', []),
-                device=resources.get('device', 'cpu'),
-                metrics_scaler=resources.get('feature_scaler_step'),
-                class_mapping=resources.get('class_mapping'),
-                logging_enabled=False,
-                num_frames=3,
-            )
-            if isinstance(classification_result, tuple) and len(classification_result) >= 2:
-                scene_type = classification_result[0]
-                video_features = classification_result[2] if len(classification_result) >= 3 else {}
-                contrast_value = video_features.get('contrast', video_features.get('metrics_avg_contrast'))
+
+            # Fast video feature extraction (10 frames, ~2s on 4K)
+            video_features = analyze_video_fast(scene_path, max_frames=10, logging_enabled=False) or {}
+            contrast_value = video_features.get('contrast', video_features.get('metrics_avg_contrast'))
+
+            # Frame extraction + neural net classification (~1s)
+            dur_result = _sp.run(
+                ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', scene_path],
+                capture_output=True, text=True, timeout=5)
+            duration = float(dur_result.stdout.strip()) if dur_result.returncode == 0 else 30.0
+            import tempfile as _tf
+            frame_dir = _tf.mkdtemp(prefix="scene_cls_")
+            frame_paths = extract_frames_from_scene(scene_path, 0.0, duration, 3, frame_dir)
+            if frame_paths:
+                scene_type, _ = classify_scene_with_model(
+                    frame_paths, video_features,
+                    resources['scene_classifier_model'],
+                    resources.get('feature_scaler_step'),
+                    resources.get('available_metrics', []),
+                    device=resources.get('device', 'cpu'),
+                    logging_enabled=False)
+            import shutil as _sh
+            _sh.rmtree(frame_dir, ignore_errors=True)
+
             analysis_time = time.time() - scene_start_time
-            print(f"      🎭 Scene: '{scene_type}' | Contrast: {contrast_value:.2f if contrast_value else 'N/A'} "
+            contrast_str = f"{contrast_value:.2f}" if contrast_value is not None else "N/A"
+            print(f"      🎭 Scene: '{scene_type}' | Contrast: {contrast_str} "
                   f"({analysis_time:.1f}s)")
         except Exception as e:
             print(f"      ⚠️ Scene classification failed ({e}), using defaults")
